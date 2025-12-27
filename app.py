@@ -1,6 +1,6 @@
 import streamlit as st
 import yfinance as yf
-from backtesting import Backtest
+from backtesting import Backtest, Strategy
 import pandas as pd
 import plotly.graph_objects as go
 import importlib.util
@@ -33,22 +33,36 @@ MARKET_CONFIG = {
     }
 }
 
-# --- HELPERS ---
-def load_all_strategies(filepath="strategy.py"):
-    if not os.path.exists(filepath): return {}, f"File '{filepath}' not found."
+# --- DYNAMIC LOADER ---
+def load_strategies_from_file(file_path):
+    if not os.path.exists(file_path): return {}, f"File '{file_path}' not found."
     try:
-        spec = importlib.util.spec_from_file_location("dynamic_strategy", filepath)
+        spec = importlib.util.spec_from_file_location("local_strategy", file_path)
         module = importlib.util.module_from_spec(spec)
-        sys.modules["dynamic_strategy"] = module
+        sys.modules["local_strategy"] = module
         spec.loader.exec_module(module)
-        
-        strategies = {}
-        for name, obj in inspect.getmembers(module):
-            if inspect.isclass(obj) and obj.__module__ == module.__name__:
-                if hasattr(obj, 'init') and hasattr(obj, 'next'): 
-                    strategies[name] = obj
-        return strategies, None
+        return _extract_strategies(module), None
     except Exception as e: return {}, str(e)
+
+def load_strategies_from_upload(uploaded_file):
+    try:
+        file_content = uploaded_file.read()
+        module_name = "uploaded_strategy"
+        spec = importlib.util.spec_from_loader(module_name, loader=None)
+        module = importlib.util.module_from_spec(spec)
+        exec(file_content, module.__dict__)
+        sys.modules[module_name] = module
+        return _extract_strategies(module), None
+    except Exception as e:
+        return {}, f"Error loading file: {str(e)}"
+
+def _extract_strategies(module):
+    strategies = {}
+    for name, obj in inspect.getmembers(module):
+        if inspect.isclass(obj):
+            if issubclass(obj, Strategy) and obj is not Strategy:
+                strategies[name] = obj
+    return strategies
 
 def get_market_status(market_code):
     config = MARKET_CONFIG[market_code]
@@ -99,28 +113,64 @@ with st.sidebar:
     else: final_ticker = user_ticker
 
     initial_cash = st.number_input("Capital", value=5000 if market_code=="IND" else 10000)
-    strategy_file = st.text_input("Strategy File", "strategy.py")
     
+    # --- STRATEGY SOURCE ---
+    st.divider()
+    st.header("4. Strategy Source")
+    strat_source = st.radio("Load Strategy From:", ["Default File (strategy.py)", "Upload Custom File"])
+    
+    strategies_dict = {}
+    load_error = None
+
+    if strat_source == "Default File (strategy.py)":
+        strategies_dict, load_error = load_strategies_from_file("strategy.py")
+    else:
+        # --- AI PROMPT HELPER ---
+        with st.expander("🤖 Use this prompt to Generate Strategy with AI"):
+            st.caption("Copy this prompt to ChatGPT/Claude to generate a compatible strategy file:")
+            ai_prompt = """
+You are an expert Python developer for Algorithmic Trading. 
+Write a complete Python script that defines a trading strategy class compatible with the `backtesting.py` library.
+
+REQUIREMENTS:
+1. Import necessary libraries: `from backtesting import Strategy`, `from backtesting.lib import crossover`, `import pandas as pd`, `import numpy as np`.
+2. Define helper functions for indicators (EMA, RSI, ADX) at the top of the file. IMPORTANT: These functions must accept raw numpy arrays (from `backtesting.py`) but convert them to `pd.Series` internally before calculating, to avoid AttributeError.
+3. Create a class inheriting from `Strategy`.
+4. In `init()`, calculate indicators using `self.I(IndicatorFunc, self.data.Close, period)`.
+5. In `next()`, implement the trading logic (Entry/Exit).
+6. Ensure the code is bug-free and handles Stop Loss / Take Profit correctly.
+
+MY STRATEGY IDEA:
+[TYPE YOUR STRATEGY HERE, e.g., Buy when RSI < 30 and Price > 200 EMA]
+            """
+            st.code(ai_prompt, language="text")
+        
+        uploaded_file = st.file_uploader("Upload .py file", type=["py"])
+        if uploaded_file:
+            strategies_dict, load_error = load_strategies_from_upload(uploaded_file)
+            if not load_error and strategies_dict:
+                st.success(f"Loaded {len(strategies_dict)} strategies!")
+        else:
+            st.info("Upload your AI-generated strategy file here.")
+
     st.divider()
     
-    st.header("4. Backtest Settings")
-    # Added "1wk" option here
+    st.header("5. Backtest Settings")
     timeframe = st.selectbox("Timeframe", ["5m", "15m", "1h", "4h", "1d", "1wk"])
     
-    # Logic for Duration options
     if timeframe in ["5m", "15m"]: 
         dur_options = ["1mo", "60d"]
         default_dur = 1
     elif timeframe in ["1h", "4h"]: 
         dur_options = ["1mo", "6mo", "1y", "2y"]
         default_dur = 2
-    else: # 1d or 1wk
+    else: 
         dur_options = ["1y", "2y", "3y", "5y", "10y", "max"]
-        default_dur = 3 # Default to 5y for weekly
+        default_dur = 2
 
     duration = st.selectbox("Duration", dur_options, index=default_dur)
     
-    if st.button("🔄 Reload Strategies"): st.cache_data.clear(); st.rerun()
+    if st.button("🔄 Reload App"): st.cache_data.clear(); st.rerun()
 
     st.divider()
     is_open, now_tz, market_name = get_market_status(market_code)
@@ -130,15 +180,19 @@ with st.sidebar:
 
 # --- MAIN ---
 st.title(f"📈 {final_ticker} ({market_code})")
-strategies_dict, error = load_all_strategies(strategy_file)
-if error: st.error(error); st.stop()
+
+if load_error:
+    st.error(f"Strategy Error: {load_error}")
+    st.stop()
+if not strategies_dict:
+    st.warning("No strategies found. Please ensure your file defines a class inheriting from 'Backtesting.Strategy'.")
+    st.stop()
 
 tab1, tab2 = st.tabs(["📊 Backtest Engine", "⚡ Live Monitor"])
 
 with tab1:
     mode = st.radio("Operation Mode", ["Single Strategy", "Compare Two Strategies"], horizontal=True)
     
-    # Common Data Fetch Logic
     def fetch_data():
         with st.spinner(f"Fetching {timeframe} data..."):
             fetch_int = "1h" if timeframe == "4h" else timeframe
@@ -171,36 +225,37 @@ with tab1:
                 st.dataframe(stats['_trades'])
 
     elif mode == "Compare Two Strategies":
-        c1, c2 = st.columns(2)
-        with c1: strat_a_name = st.selectbox("Strategy A", list(strategies_dict.keys()), index=0)
-        with c2: strat_b_name = st.selectbox("Strategy B", list(strategies_dict.keys()), index=min(1, len(strategies_dict)-1))
-        
-        if st.button("⚔️ Run Comparison"):
-            df = fetch_data()
-            if not df.empty:
-                # Run A
-                bt_a = Backtest(df, strategies_dict[strat_a_name], cash=initial_cash, commission=0.001)
-                stats_a = bt_a.run()
-                # Run B
-                bt_b = Backtest(df, strategies_dict[strat_b_name], cash=initial_cash, commission=0.001)
-                stats_b = bt_b.run()
-                
-                col_a, col_b = st.columns(2)
-                sym = "₹" if market_code == "IND" else "$"
-                
-                with col_a:
-                    st.subheader(f"🅰️ {strat_a_name}")
-                    st.metric("Equity", f"{sym}{stats_a['Equity Final [$]']:.2f}", f"{stats_a['Return [%]']:.2f}%")
-                    st.metric("Drawdown", f"{stats_a['Max. Drawdown [%]']:.2f}%")
-                    st.metric("Win Rate", f"{stats_a['Win Rate [%]']:.1f}%")
-                    st.line_chart(stats_a['_equity_curve']['Equity'])
+        if len(strategies_dict) < 2:
+            st.error("Need at least 2 strategies to compare.")
+        else:
+            c1, c2 = st.columns(2)
+            with c1: strat_a_name = st.selectbox("Strategy A", list(strategies_dict.keys()), index=0)
+            with c2: strat_b_name = st.selectbox("Strategy B", list(strategies_dict.keys()), index=min(1, len(strategies_dict)-1))
+            
+            if st.button("⚔️ Run Comparison"):
+                df = fetch_data()
+                if not df.empty:
+                    bt_a = Backtest(df, strategies_dict[strat_a_name], cash=initial_cash, commission=0.001)
+                    stats_a = bt_a.run()
+                    bt_b = Backtest(df, strategies_dict[strat_b_name], cash=initial_cash, commission=0.001)
+                    stats_b = bt_b.run()
                     
-                with col_b:
-                    st.subheader(f"🅱️ {strat_b_name}")
-                    st.metric("Equity", f"{sym}{stats_b['Equity Final [$]']:.2f}", f"{stats_b['Return [%]']:.2f}%")
-                    st.metric("Drawdown", f"{stats_b['Max. Drawdown [%]']:.2f}%")
-                    st.metric("Win Rate", f"{stats_b['Win Rate [%]']:.1f}%")
-                    st.line_chart(stats_b['_equity_curve']['Equity'])
+                    col_a, col_b = st.columns(2)
+                    sym = "₹" if market_code == "IND" else "$"
+                    
+                    with col_a:
+                        st.subheader(f"🅰️ {strat_a_name}")
+                        st.metric("Equity", f"{sym}{stats_a['Equity Final [$]']:.2f}", f"{stats_a['Return [%]']:.2f}%")
+                        st.metric("Drawdown", f"{stats_a['Max. Drawdown [%]']:.2f}%")
+                        st.metric("Win Rate", f"{stats_a['Win Rate [%]']:.1f}%")
+                        st.line_chart(stats_a['_equity_curve']['Equity'])
+                        
+                    with col_b:
+                        st.subheader(f"🅱️ {strat_b_name}")
+                        st.metric("Equity", f"{sym}{stats_b['Equity Final [$]']:.2f}", f"{stats_b['Return [%]']:.2f}%")
+                        st.metric("Drawdown", f"{stats_b['Max. Drawdown [%]']:.2f}%")
+                        st.metric("Win Rate", f"{stats_b['Win Rate [%]']:.1f}%")
+                        st.line_chart(stats_b['_equity_curve']['Equity'])
 
 with tab2:
     if not is_open: st.warning(f"{market_name} is Closed. Live monitor inactive.")
